@@ -54,6 +54,7 @@ addEventListener('resize', resize);
 // ---------------------------------------------------------------- BVH motion
 let bvh = null, bvhFirst = null;
 let parentNameOf = {};
+let fingerOf = {}; // hand joint name -> { thumb, middle } direct-child names
 const skelGroup = new THREE.Group();
 scene.add(skelGroup);
 let skelLines = null;
@@ -64,6 +65,17 @@ async function loadBVHText(text, label) {
   parentNameOf = {};
   bvh.joints.forEach((j) => {
     parentNameOf[j.name] = j.parent >= 0 ? bvh.joints[j.parent].name : null;
+  });
+  fingerOf = {};
+  bvh.joints.forEach((j, i) => {
+    if (!/Hand$/.test(j.name)) return;
+    const entry = {};
+    bvh.joints.forEach((c) => {
+      if (c.parent !== i) return;
+      if (/Thumb/.test(c.name) && !entry.thumb) entry.thumb = c.name;
+      if (/Middle/.test(c.name) && !entry.middle) entry.middle = c.name;
+    });
+    if (entry.thumb && entry.middle) fingerOf[j.name] = entry;
   });
   buildSkeletonLines();
   const seek = document.getElementById('seek');
@@ -155,9 +167,12 @@ function bendNormal(d1, d2, ownDir, axes, virtSign) {
 // ------------------------------------------------------------------------ VRM
 // [SOMA BVH joint, VRM humanoid bone, primary child BVH joint (null =
 // incoming dir), grandchild BVH joint, bend mode, virtual-bend sign]
-// bend mode: 'next' = plane of (own bone, next bone) for shoulder/hip and
-// upper arm/leg; 'in' = plane of (incoming bone, own bone) for the hinge
-// joints themselves (forearm, shin, foot); null = body-axis frame.
+// bend mode: 'next' = plane of (own bone, next bone) for hip and upper
+// arm/leg; 'in' = plane of (incoming bone, own bone) for the hinge joints
+// themselves (forearm, shin, foot); 'incoming' = frame from the incoming
+// direction only (shoulders: the BVH shoulder does not rotate with the
+// arm, so its frame must not be built from the arm direction);
+// 'finger' = hand frame from finger geometry; null = body-axis frame.
 const MAP = [
   ['Hips', 'hips', 'Spine1', null, null, 0],
   ['Spine1', 'spine', 'Spine2', null, null, 0],
@@ -165,14 +180,14 @@ const MAP = [
   ['Chest', 'upperChest', 'Neck1', null, null, 0],
   ['Neck1', 'neck', 'Neck2', null, null, 0],
   ['Head', 'head', null, null, null, 0],
-  ['LeftShoulder', 'leftShoulder', 'LeftArm', 'LeftForeArm', 'next', 1],
+  ['LeftShoulder', 'leftShoulder', 'LeftArm', 'LeftForeArm', 'incoming', 0],
   ['LeftArm', 'leftUpperArm', 'LeftForeArm', 'LeftHand', 'next', 1],
   ['LeftForeArm', 'leftLowerArm', 'LeftHand', null, 'in', 1],
-  ['LeftHand', 'leftHand', null, null, null, 0],
-  ['RightShoulder', 'rightShoulder', 'RightArm', 'RightForeArm', 'next', 1],
+  ['LeftHand', 'leftHand', null, null, 'finger', 0],
+  ['RightShoulder', 'rightShoulder', 'RightArm', 'RightForeArm', 'incoming', 0],
   ['RightArm', 'rightUpperArm', 'RightForeArm', 'RightHand', 'next', 1],
   ['RightForeArm', 'rightLowerArm', 'RightHand', null, 'in', 1],
-  ['RightHand', 'rightHand', null, null, null, 0],
+  ['RightHand', 'rightHand', null, null, 'finger', 0],
   ['LeftLeg', 'leftUpperLeg', 'LeftShin', 'LeftFoot', 'next', -1],
   ['LeftShin', 'leftLowerLeg', 'LeftFoot', 'LeftToeBase', 'in', -1],
   ['LeftFoot', 'leftFoot', 'LeftToeBase', null, 'in', 1],
@@ -189,32 +204,43 @@ const DST_NEXT = {
   leftUpperLeg: 'leftFoot', leftLowerLeg: 'leftToes',
   rightUpperLeg: 'rightFoot', rightLowerLeg: 'rightToes',
 };
-// Leaf bones whose orientation follows the parent bone (hand follows the
-// forearm, toes follow the foot): their world target is the parent's
-// world target times the rest-pose relative rotation. A BVH gives no
-// twist for these joints beyond the wrist/ankle position, and a frame
-// built from body axes gave VRoid-style models a stiff, flat palm.
+// Leaf bones whose orientation follows the parent bone (toes follow the
+// foot; hands use this only as a fallback): their world target is the
+// parent's world target times the rest-pose relative rotation.
 const FOLLOW_PARENT = {
   leftHand: 'leftLowerArm', rightHand: 'rightLowerArm',
   leftToes: 'leftFoot', rightToes: 'rightFoot',
 };
-// Bones whose world rotation is damped towards rest (0..1). The BVH
-// shoulder is a virtual joint: its geometric frame swings with the arm,
-// but a real clavicle barely rotates. Transferring it 1:1 makes shoulder
-// pads and wide sleeves ride up, so shoulders are damped.
-const DAMP = { leftShoulder: 0.4, rightShoulder: 0.4 };
+// Bones whose world rotation is damped towards rest (0..1). (Shoulders
+// used to be damped here; they now use 'incoming' frames instead - see
+// MAP - because the BVH shoulder joint itself does not rotate with the
+// arm at all, so any arm-derived rotation is an artifact.)
+const DAMP = {};
+// Finger bones used to build a true hand frame (thumb side + middle
+// finger direction define the palm plane), per hand bone.
+const FINGER_NODES = {
+  leftHand: ['leftThumbMetacarpal', 'leftMiddleProximal'],
+  rightHand: ['rightThumbMetacarpal', 'rightMiddleProximal'],
+};
+
+// Frame of a hand from three points: wrist, middle-finger base, thumb
+// base. Y = finger direction, Z = palm-plane normal. Same construction
+// on BVH geometry and on the VRM rig, so palm orientation transfers.
+function handFrameQuat(wrist, middle, thumb) {
+  const y = middle.clone().sub(wrist).normalize();
+  const t = thumb.clone().sub(wrist).normalize();
+  const z = new THREE.Vector3().crossVectors(y, t).normalize();
+  const x = new THREE.Vector3().crossVectors(y, z);
+  const zz = new THREE.Vector3().crossVectors(x, y);
+  const m = new THREE.Matrix4().makeBasis(x, y, zz);
+  return new THREE.Quaternion().setFromRotationMatrix(m);
+}
 // humanoid hinge bone -> its parent humanoid bone (incoming direction)
 const DST_PARENT_BONE = {
   leftLowerArm: 'leftUpperArm', rightLowerArm: 'rightUpperArm',
   leftLowerLeg: 'leftUpperLeg', rightLowerLeg: 'rightUpperLeg',
   leftFoot: 'leftLowerLeg', rightFoot: 'rightLowerLeg',
-};
-// humanoid bone -> [bend mode, virtual-bend sign] (mirrors MAP)
-const DST_BEND = {
-  leftShoulder: ['next', 1], leftUpperArm: ['next', 1], leftLowerArm: ['in', 1],
-  rightShoulder: ['next', 1], rightUpperArm: ['next', 1], rightLowerArm: ['in', 1],
-  leftUpperLeg: ['next', -1], leftLowerLeg: ['in', -1], leftFoot: ['in', 1],
-  rightUpperLeg: ['next', -1], rightLowerLeg: ['in', -1], rightFoot: ['in', 1],
+  leftShoulder: 'upperChest', rightShoulder: 'upperChest',
 };
 // humanoid bone -> its primary child humanoid bone (null = incoming dir)
 const DST_CHILD = {
@@ -260,6 +286,12 @@ async function loadVRM(url, label) {
     if (!node) continue;
     dstNode[boneName] = node;
     dstPos[boneName] = node.getWorldPosition(new THREE.Vector3());
+  }
+  for (const pair of Object.values(FINGER_NODES)) {
+    for (const fn of pair) {
+      const n = vrm.humanoid.getNormalizedBoneNode(fn);
+      if (n) dstPos[fn] = n.getWorldPosition(new THREE.Vector3());
+    }
   }
   if (!dstNode.hips) throw new Error('VRMにhipsボーンがありません');
   // if upperChest is missing, chest's child falls back to neck
@@ -314,13 +346,26 @@ async function loadVRM(url, label) {
       r.boneDir = posOf(r.boneName).clone().sub(parentPos || new THREE.Vector3());
     }
     r.restQ = r.node.getWorldQuaternion(new THREE.Quaternion());
-    let frameN = null;
-    if (r.bendMode === 'next' && r.nextDir) {
-      frameN = bendNormal(r.boneDir, r.nextDir, r.boneDir, axes, r.virtSign);
-    } else if (r.bendMode === 'in' && r.incomingDir) {
-      frameN = bendNormal(r.incomingDir, r.boneDir, r.boneDir, axes, r.virtSign);
+    const fing = FINGER_NODES[r.boneName];
+    if (r.bendMode === 'incoming' && r.incomingDir) {
+      // Shoulder: frame from the incoming direction (chest -> shoulder),
+      // NOT from the arm direction. In the BVH data the shoulder joint
+      // does not rotate when the arm raises (both shoulders keep the
+      // same world orientation); a frame built from the arm direction
+      // invents that rotation and flings pads/sleeves around.
+      r.frameQ = geoQuat(posOf(r.boneName), r.incomingDir, axes, null);
+    } else if (r.bendMode === 'finger' && fing && dstPos[fing[0]] && dstPos[fing[1]]) {
+      r.frameQ = handFrameQuat(posOf(r.boneName), dstPos[fing[1]], dstPos[fing[0]]);
+      r.fingerFrame = true;
+    } else {
+      let frameN = null;
+      if (r.bendMode === 'next' && r.nextDir) {
+        frameN = bendNormal(r.boneDir, r.nextDir, r.boneDir, axes, r.virtSign);
+      } else if (r.bendMode === 'in' && r.incomingDir) {
+        frameN = bendNormal(r.incomingDir, r.boneDir, r.boneDir, axes, r.virtSign);
+      }
+      r.frameQ = geoQuat(posOf(r.boneName), r.boneDir, axes, frameN);
     }
-    r.frameQ = geoQuat(posOf(r.boneName), r.boneDir, axes, frameN);
   }
   rig.hipsNode = dstNode.hips;
   rig.hipsRestPos = dstNode.hips.position.clone();
@@ -339,7 +384,12 @@ function applyPose(world) {
   for (const r of rig) {
     let targetWorldQ;
     const parentTarget = r.followParent ? worldByBone.get(r.followParent) : null;
-    if (parentTarget) {
+    const srcFing = fingerOf[r.srcName];
+    if (r.fingerFrame && srcFing && world[srcFing.thumb] && world[srcFing.middle]) {
+      const jp0 = V3(world[r.srcName].pos);
+      const aSrc = handFrameQuat(jp0, V3(world[srcFing.middle].pos), V3(world[srcFing.thumb].pos));
+      targetWorldQ = aSrc.multiply(r.frameQ.clone().invert()).multiply(r.restQ);
+    } else if (parentTarget) {
       const parentRest = rig.find((x) => x.boneName === r.followParent).restQ;
       const rel = parentRest.clone().invert().multiply(r.restQ);
       targetWorldQ = parentTarget.clone().multiply(rel);
@@ -348,6 +398,11 @@ function applyPose(world) {
       let boneDir;
       if (r.srcChild && world[r.srcChild]) boneDir = V3(world[r.srcChild].pos).sub(jp);
       else boneDir = jp.clone().sub(V3(world[SRC_PARENT[r.srcName]].pos));
+      let frameDir = boneDir;
+      if (r.bendMode === 'incoming') {
+        const pn = parentNameOf[r.srcName];
+        if (pn && world[pn]) frameDir = jp.clone().sub(V3(world[pn].pos));
+      }
       let planeN = null;
       if (r.bendMode === 'next' && r.srcNext && r.srcChild && world[r.srcNext] && world[r.srcChild]) {
         const nd = V3(world[r.srcNext].pos).sub(V3(world[r.srcChild].pos));
@@ -359,7 +414,7 @@ function applyPose(world) {
           planeN = bendNormal(incoming, boneDir, boneDir, srcAxes, r.virtSign);
         }
       }
-      const aSrc = geoQuat(jp, boneDir, srcAxes, planeN);
+      const aSrc = geoQuat(jp, frameDir, srcAxes, planeN);
       targetWorldQ = aSrc.multiply(r.frameQ.clone().invert()).multiply(r.restQ);
     }
     if (r.damp < 1) targetWorldQ = r.restQ.clone().slerp(targetWorldQ, r.damp);
