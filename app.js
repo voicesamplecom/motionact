@@ -189,6 +189,20 @@ const DST_NEXT = {
   leftUpperLeg: 'leftFoot', leftLowerLeg: 'leftToes',
   rightUpperLeg: 'rightFoot', rightLowerLeg: 'rightToes',
 };
+// Leaf bones whose orientation follows the parent bone (hand follows the
+// forearm, toes follow the foot): their world target is the parent's
+// world target times the rest-pose relative rotation. A BVH gives no
+// twist for these joints beyond the wrist/ankle position, and a frame
+// built from body axes gave VRoid-style models a stiff, flat palm.
+const FOLLOW_PARENT = {
+  leftHand: 'leftLowerArm', rightHand: 'rightLowerArm',
+  leftToes: 'leftFoot', rightToes: 'rightFoot',
+};
+// Bones whose world rotation is damped towards rest (0..1). The BVH
+// shoulder is a virtual joint: its geometric frame swings with the arm,
+// but a real clavicle barely rotates. Transferring it 1:1 makes shoulder
+// pads and wide sleeves ride up, so shoulders are damped.
+const DAMP = { leftShoulder: 0.4, rightShoulder: 0.4 };
 // humanoid hinge bone -> its parent humanoid bone (incoming direction)
 const DST_PARENT_BONE = {
   leftLowerArm: 'leftUpperArm', rightLowerArm: 'rightUpperArm',
@@ -282,6 +296,8 @@ async function loadVRM(url, label) {
     rig.push({
       node, boneName, srcName, srcChild, srcNext, bendMode, virtSign,
       childName, boneDir, nextDir, incomingDir,
+      followParent: FOLLOW_PARENT[boneName] || null,
+      damp: DAMP[boneName] ?? 1,
     });
   }
   // resolve incoming directions and rest frames
@@ -319,24 +335,34 @@ function applyPose(world) {
     chestAnchor: V3(world['Chest'].pos), hipsAnchor: V3(world['Hips'].pos),
   }[k]));
   const nodeWorld = new Map();
+  const worldByBone = new Map();
   for (const r of rig) {
-    const jp = V3(world[r.srcName].pos);
-    let boneDir;
-    if (r.srcChild && world[r.srcChild]) boneDir = V3(world[r.srcChild].pos).sub(jp);
-    else boneDir = jp.clone().sub(V3(world[SRC_PARENT[r.srcName]].pos));
-    let planeN = null;
-    if (r.bendMode === 'next' && r.srcNext && r.srcChild && world[r.srcNext] && world[r.srcChild]) {
-      const nd = V3(world[r.srcNext].pos).sub(V3(world[r.srcChild].pos));
-      planeN = bendNormal(boneDir, nd, boneDir, srcAxes, r.virtSign);
-    } else if (r.bendMode === 'in') {
-      const pn = parentNameOf[r.srcName];
-      if (pn && world[pn]) {
-        const incoming = jp.clone().sub(V3(world[pn].pos));
-        planeN = bendNormal(incoming, boneDir, boneDir, srcAxes, r.virtSign);
+    let targetWorldQ;
+    const parentTarget = r.followParent ? worldByBone.get(r.followParent) : null;
+    if (parentTarget) {
+      const parentRest = rig.find((x) => x.boneName === r.followParent).restQ;
+      const rel = parentRest.clone().invert().multiply(r.restQ);
+      targetWorldQ = parentTarget.clone().multiply(rel);
+    } else {
+      const jp = V3(world[r.srcName].pos);
+      let boneDir;
+      if (r.srcChild && world[r.srcChild]) boneDir = V3(world[r.srcChild].pos).sub(jp);
+      else boneDir = jp.clone().sub(V3(world[SRC_PARENT[r.srcName]].pos));
+      let planeN = null;
+      if (r.bendMode === 'next' && r.srcNext && r.srcChild && world[r.srcNext] && world[r.srcChild]) {
+        const nd = V3(world[r.srcNext].pos).sub(V3(world[r.srcChild].pos));
+        planeN = bendNormal(boneDir, nd, boneDir, srcAxes, r.virtSign);
+      } else if (r.bendMode === 'in') {
+        const pn = parentNameOf[r.srcName];
+        if (pn && world[pn]) {
+          const incoming = jp.clone().sub(V3(world[pn].pos));
+          planeN = bendNormal(incoming, boneDir, boneDir, srcAxes, r.virtSign);
+        }
       }
+      const aSrc = geoQuat(jp, boneDir, srcAxes, planeN);
+      targetWorldQ = aSrc.multiply(r.frameQ.clone().invert()).multiply(r.restQ);
     }
-    const aSrc = geoQuat(jp, boneDir, srcAxes, planeN);
-    const targetWorldQ = aSrc.multiply(r.frameQ.clone().invert()).multiply(r.restQ);
+    if (r.damp < 1) targetWorldQ = r.restQ.clone().slerp(targetWorldQ, r.damp);
     let parent = r.node.parent, parentQ = null;
     while (parent) {
       if (nodeWorld.has(parent)) { parentQ = nodeWorld.get(parent); break; }
@@ -347,6 +373,7 @@ function applyPose(world) {
       : targetWorldQ.clone();
     r.node.quaternion.copy(local);
     nodeWorld.set(r.node, targetWorldQ);
+    worldByBone.set(r.boneName, targetWorldQ);
   }
   // hips translation: XZ/Y travel relative to the first frame (meters).
   // "zero origin" off keeps the first frame's ground (XZ) position as-is.

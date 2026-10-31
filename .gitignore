@@ -1,0 +1,3 @@
+# VRM models are user data: loaded locally in the browser, never committed.
+models/
+*.vrm
