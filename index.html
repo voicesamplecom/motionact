@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SOMA BVH → VRM プレイヤー</title>
+<style>
+  html, body { margin: 0; height: 100%; font-family: system-ui, sans-serif; background: #14161a; color: #e8eaed; }
+  #app { display: flex; flex-direction: column; height: 100%; }
+  header { padding: 10px 14px; display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; background: #1d2026; }
+  header h1 { font-size: 15px; margin: 0 8px 0 0; font-weight: 600; }
+  label { font-size: 12.5px; display: inline-flex; gap: 6px; align-items: center; }
+  button, select, input[type="range"] { accent-color: #5b9dff; }
+  button { background: #2a2f38; color: #e8eaed; border: 1px solid #3a4150; border-radius: 6px; padding: 5px 10px; cursor: pointer; }
+  button:hover { background: #343b47; }
+  input[type="file"] { font-size: 12px; max-width: 210px; }
+  #view { flex: 1; position: relative; min-height: 0; }
+  canvas { display: block; }
+  #status { font-size: 12px; color: #9fb2cc; padding: 6px 14px; background: #1d2026; min-height: 16px; }
+  #drop { position: absolute; inset: 0; display: none; place-items: center; background: rgba(20,30,50,.55);
+           font-size: 18px; pointer-events: none; z-index: 5; }
+  .grow { flex: 1; }
+  #seek { width: 220px; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "./vendor/three.module.js",
+    "three/addons/": "./vendor/three/addons/",
+    "@pixiv/three-vrm": "./vendor/three-vrm.module.js"
+  }
+}
+</script>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>SOMA BVH → VRM プレイヤー</h1>
+    <label>VRM <input type="file" id="vrmFile" accept=".vrm"></label>
+    <label>BVH <input type="file" id="bvhFile" accept=".bvh"></label>
+    <button id="playBtn">⏸ 一時停止</button>
+    <input type="range" id="seek" min="0" max="49" step="0.01" value="0">
+    <span id="timeLabel" style="font-size:12px">0.00 / 0.00 s</span>
+    <label>速度
+      <select id="speed"><option>0.25</option><option>0.5</option><option selected>1</option><option>1.5</option><option>2</option></select>
+    </label>
+    <label><input type="checkbox" id="showSkel"> BVH骨格を表示</label>
+    <label><input type="checkbox" id="zeroOrigin" checked> 移動を原点から</label>
+    <label>モデル回転
+      <select id="rotY"><option value="0">0°</option><option value="90">90°</option><option value="180">180°</option><option value="270">270°</option></select>
+    </label>
+  </header>
+  <div id="view"><div id="drop">VRM / BVH をドロップ</div></div>
+  <div id="status">読み込み中…</div>
+</div>
+<script type="module" src="./app.js"></script>
+</body>
+</html>
