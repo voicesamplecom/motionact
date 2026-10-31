@@ -13,8 +13,9 @@
 // This transfers the absolute pose (e.g. arms hanging down while walking),
 // unlike bind-pose delta methods: the MotionBricks bind pose is a straight
 // stick along +X, so deltas from bind contain a spurious lying->standing
-// rotation. Known limitation: twist around each bone's own axis is only
-// approximated, because the frame comes from body-level axes.
+// rotation. For hinge chains (arms / legs) the frame's twist comes from the
+// actual bend plane of the two bones, so elbows and knees bend the right
+// way; other joints still derive twist from body-level axes (approximate).
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
@@ -52,6 +53,7 @@ addEventListener('resize', resize);
 
 // ---------------------------------------------------------------- BVH motion
 let bvh = null, bvhFirst = null;
+let parentNameOf = {};
 const skelGroup = new THREE.Group();
 scene.add(skelGroup);
 let skelLines = null;
@@ -59,6 +61,10 @@ let skelLines = null;
 async function loadBVHText(text, label) {
   bvh = parseBVH(text);
   bvhFirst = sampleWorld(bvh, 0);
+  parentNameOf = {};
+  bvh.joints.forEach((j) => {
+    parentNameOf[j.name] = j.parent >= 0 ? bvh.joints[j.parent].name : null;
+  });
   buildSkeletonLines();
   const seek = document.getElementById('seek');
   seek.max = bvh.frameCount - 1;
@@ -101,9 +107,26 @@ function bodyAxes(getPos) {
   return { left, forward };
 }
 
-// Quaternion of the geometric frame: Y = bone dir, X = orthogonal secondary.
-function geoQuat(jointPos, boneDirVec, axes) {
+// Quaternion of the geometric frame: Y = bone dir, Z = frame normal.
+//
+// For limb joints the normal comes from the chain's bend plane (see
+// bendNormal): it is the hinge axis of the elbow / knee / ankle, so the
+// transferred twist follows which way the hinge actually faces. Deriving
+// twist from body axes instead made raised arms twist the wrong way
+// (the secondary axis flips when a bone passes the switch threshold).
+// Other joints (spine, head, hands) keep the body-axis construction.
+function geoQuat(jointPos, boneDirVec, axes, planeN = null) {
   const y = boneDirVec.clone().normalize();
+  if (planeN) {
+    const z = planeN.clone().addScaledVector(y, -planeN.dot(y));
+    if (z.lengthSq() > 1e-6) {
+      z.normalize();
+      const x = new THREE.Vector3().crossVectors(y, z);
+      const zz = new THREE.Vector3().crossVectors(x, y);
+      const m = new THREE.Matrix4().makeBasis(x, y, zz);
+      return new THREE.Quaternion().setFromRotationMatrix(m);
+    }
+  }
   const s = Math.abs(y.dot(axes.left)) < 0.8 ? axes.left : axes.forward;
   const x = s.clone().addScaledVector(y, -s.dot(y)).normalize();
   const z = new THREE.Vector3().crossVectors(x, y);
@@ -111,32 +134,74 @@ function geoQuat(jointPos, boneDirVec, axes) {
   return new THREE.Quaternion().setFromRotationMatrix(m);
 }
 
+// Plane normal (hinge axis) from two bone directions. When the chain is
+// nearly straight the plane is undefined, so fall back to a virtual bend:
+// the direction the next bone would point if the hinge bent anatomically
+// (forearm bends towards body-forward, shin towards body-backward),
+// passed as virtSign * axes.forward. Source and target use the same rule,
+// so the frames stay consistent even at a straight rest pose (T-pose).
+function bendNormal(d1, d2, ownDir, axes, virtSign) {
+  const n = new THREE.Vector3().crossVectors(
+    d1.clone().normalize(), d2.clone().normalize());
+  if (n.length() > 0.05) return n;
+  if (virtSign) {
+    const virt = axes.forward.clone().multiplyScalar(virtSign);
+    const nv = new THREE.Vector3().crossVectors(ownDir.clone().normalize(), virt);
+    if (nv.length() > 0.05) return nv;
+  }
+  return null;
+}
+
 // ------------------------------------------------------------------------ VRM
-// [SOMA BVH joint, VRM humanoid bone, primary child BVH joint (null = incoming dir)]
+// [SOMA BVH joint, VRM humanoid bone, primary child BVH joint (null =
+// incoming dir), grandchild BVH joint, bend mode, virtual-bend sign]
+// bend mode: 'next' = plane of (own bone, next bone) for shoulder/hip and
+// upper arm/leg; 'in' = plane of (incoming bone, own bone) for the hinge
+// joints themselves (forearm, shin, foot); null = body-axis frame.
 const MAP = [
-  ['Hips', 'hips', 'Spine1'],
-  ['Spine1', 'spine', 'Spine2'],
-  ['Spine2', 'chest', 'Chest'],
-  ['Chest', 'upperChest', 'Neck1'],
-  ['Neck1', 'neck', 'Neck2'],
-  ['Head', 'head', null],
-  ['LeftShoulder', 'leftShoulder', 'LeftArm'],
-  ['LeftArm', 'leftUpperArm', 'LeftForeArm'],
-  ['LeftForeArm', 'leftLowerArm', 'LeftHand'],
-  ['LeftHand', 'leftHand', null],
-  ['RightShoulder', 'rightShoulder', 'RightArm'],
-  ['RightArm', 'rightUpperArm', 'RightForeArm'],
-  ['RightForeArm', 'rightLowerArm', 'RightHand'],
-  ['RightHand', 'rightHand', null],
-  ['LeftLeg', 'leftUpperLeg', 'LeftShin'],
-  ['LeftShin', 'leftLowerLeg', 'LeftFoot'],
-  ['LeftFoot', 'leftFoot', 'LeftToeBase'],
-  ['LeftToeBase', 'leftToes', null],
-  ['RightLeg', 'rightUpperLeg', 'RightShin'],
-  ['RightShin', 'rightLowerLeg', 'RightFoot'],
-  ['RightFoot', 'rightFoot', 'RightToeBase'],
-  ['RightToeBase', 'rightToes', null],
+  ['Hips', 'hips', 'Spine1', null, null, 0],
+  ['Spine1', 'spine', 'Spine2', null, null, 0],
+  ['Spine2', 'chest', 'Chest', null, null, 0],
+  ['Chest', 'upperChest', 'Neck1', null, null, 0],
+  ['Neck1', 'neck', 'Neck2', null, null, 0],
+  ['Head', 'head', null, null, null, 0],
+  ['LeftShoulder', 'leftShoulder', 'LeftArm', 'LeftForeArm', 'next', 1],
+  ['LeftArm', 'leftUpperArm', 'LeftForeArm', 'LeftHand', 'next', 1],
+  ['LeftForeArm', 'leftLowerArm', 'LeftHand', null, 'in', 1],
+  ['LeftHand', 'leftHand', null, null, null, 0],
+  ['RightShoulder', 'rightShoulder', 'RightArm', 'RightForeArm', 'next', 1],
+  ['RightArm', 'rightUpperArm', 'RightForeArm', 'RightHand', 'next', 1],
+  ['RightForeArm', 'rightLowerArm', 'RightHand', null, 'in', 1],
+  ['RightHand', 'rightHand', null, null, null, 0],
+  ['LeftLeg', 'leftUpperLeg', 'LeftShin', 'LeftFoot', 'next', -1],
+  ['LeftShin', 'leftLowerLeg', 'LeftFoot', 'LeftToeBase', 'in', -1],
+  ['LeftFoot', 'leftFoot', 'LeftToeBase', null, 'in', 1],
+  ['LeftToeBase', 'leftToes', null, null, null, 0],
+  ['RightLeg', 'rightUpperLeg', 'RightShin', 'RightFoot', 'next', -1],
+  ['RightShin', 'rightLowerLeg', 'RightFoot', 'RightToeBase', 'in', -1],
+  ['RightFoot', 'rightFoot', 'RightToeBase', null, 'in', 1],
+  ['RightToeBase', 'rightToes', null, null, null, 0],
 ];
+// humanoid bone -> grandchild humanoid bone (bend plane), when defined
+const DST_NEXT = {
+  leftShoulder: 'leftLowerArm', leftUpperArm: 'leftHand',
+  rightShoulder: 'rightLowerArm', rightUpperArm: 'rightHand',
+  leftUpperLeg: 'leftFoot', leftLowerLeg: 'leftToes',
+  rightUpperLeg: 'rightFoot', rightLowerLeg: 'rightToes',
+};
+// humanoid hinge bone -> its parent humanoid bone (incoming direction)
+const DST_PARENT_BONE = {
+  leftLowerArm: 'leftUpperArm', rightLowerArm: 'rightUpperArm',
+  leftLowerLeg: 'leftUpperLeg', rightLowerLeg: 'rightUpperLeg',
+  leftFoot: 'leftLowerLeg', rightFoot: 'rightLowerLeg',
+};
+// humanoid bone -> [bend mode, virtual-bend sign] (mirrors MAP)
+const DST_BEND = {
+  leftShoulder: ['next', 1], leftUpperArm: ['next', 1], leftLowerArm: ['in', 1],
+  rightShoulder: ['next', 1], rightUpperArm: ['next', 1], rightLowerArm: ['in', 1],
+  leftUpperLeg: ['next', -1], leftLowerLeg: ['in', -1], leftFoot: ['in', 1],
+  rightUpperLeg: ['next', -1], rightLowerLeg: ['in', -1], rightFoot: ['in', 1],
+};
 // humanoid bone -> its primary child humanoid bone (null = incoming dir)
 const DST_CHILD = {
   hips: 'spine', spine: 'chest', chest: 'upperChest', upperChest: 'neck',
@@ -195,7 +260,7 @@ async function loadVRM(url, label) {
   }[k].clone()));
 
   rig = [];
-  for (const [srcName, boneName, srcChild] of MAP) {
+  for (const [srcName, boneName, srcChild, srcNext, bendMode, virtSign] of MAP) {
     const node = dstNode[boneName];
     if (!node) continue;
     const childName = childOf(boneName);
@@ -204,7 +269,20 @@ async function loadVRM(url, label) {
     else {
       boneDir = null; // incoming direction, resolved below from the parent node
     }
-    rig.push({ node, boneName, srcName, srcChild, childName, boneDir });
+    const nextName = DST_NEXT[boneName];
+    let nextDir = null;
+    if (nextName && childName && dstNode[nextName]) {
+      nextDir = dstPos[nextName].clone().sub(dstPos[childName]);
+    }
+    const pName = DST_PARENT_BONE[boneName];
+    let incomingDir = null;
+    if (pName && dstNode[pName]) {
+      incomingDir = dstPos[boneName].clone().sub(dstPos[pName]);
+    }
+    rig.push({
+      node, boneName, srcName, srcChild, srcNext, bendMode, virtSign,
+      childName, boneDir, nextDir, incomingDir,
+    });
   }
   // resolve incoming directions and rest frames
   const posOf = (boneName) => dstPos[boneName];
@@ -220,7 +298,13 @@ async function loadVRM(url, label) {
       r.boneDir = posOf(r.boneName).clone().sub(parentPos || new THREE.Vector3());
     }
     r.restQ = r.node.getWorldQuaternion(new THREE.Quaternion());
-    r.frameQ = geoQuat(posOf(r.boneName), r.boneDir, axes);
+    let frameN = null;
+    if (r.bendMode === 'next' && r.nextDir) {
+      frameN = bendNormal(r.boneDir, r.nextDir, r.boneDir, axes, r.virtSign);
+    } else if (r.bendMode === 'in' && r.incomingDir) {
+      frameN = bendNormal(r.incomingDir, r.boneDir, r.boneDir, axes, r.virtSign);
+    }
+    r.frameQ = geoQuat(posOf(r.boneName), r.boneDir, axes, frameN);
   }
   rig.hipsNode = dstNode.hips;
   rig.hipsRestPos = dstNode.hips.position.clone();
@@ -240,7 +324,18 @@ function applyPose(world) {
     let boneDir;
     if (r.srcChild && world[r.srcChild]) boneDir = V3(world[r.srcChild].pos).sub(jp);
     else boneDir = jp.clone().sub(V3(world[SRC_PARENT[r.srcName]].pos));
-    const aSrc = geoQuat(jp, boneDir, srcAxes);
+    let planeN = null;
+    if (r.bendMode === 'next' && r.srcNext && r.srcChild && world[r.srcNext] && world[r.srcChild]) {
+      const nd = V3(world[r.srcNext].pos).sub(V3(world[r.srcChild].pos));
+      planeN = bendNormal(boneDir, nd, boneDir, srcAxes, r.virtSign);
+    } else if (r.bendMode === 'in') {
+      const pn = parentNameOf[r.srcName];
+      if (pn && world[pn]) {
+        const incoming = jp.clone().sub(V3(world[pn].pos));
+        planeN = bendNormal(incoming, boneDir, boneDir, srcAxes, r.virtSign);
+      }
+    }
+    const aSrc = geoQuat(jp, boneDir, srcAxes, planeN);
     const targetWorldQ = aSrc.multiply(r.frameQ.clone().invert()).multiply(r.restQ);
     let parent = r.node.parent, parentQ = null;
     while (parent) {

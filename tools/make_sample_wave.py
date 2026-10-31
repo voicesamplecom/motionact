@@ -69,9 +69,13 @@ def pose(f):
     r["LeftArm"] = [-75 + 6 * s, 0, -8 * s]
     r["LeftForeArm"] = [-8, 0, 0]
     # right arm raised, waving (forearm oscillates fast)
+    # NOTE the sign: with the upper arm at about -110 deg, the forearm
+    # needs a *positive* z to open upward (hand above the elbow, waving).
+    # A negative z folds the forearm over the head, which reads as an
+    # elbow bending backwards.
     wave = math.sin(4 * t)
     r["RightArm"] = [-110 + 7 * wave, 0, 0]
-    r["RightForeArm"] = [-18 + 14 * wave, 0, 0]
+    r["RightForeArm"] = [24 + 13 * wave, 0, 0]
     hips_pos = (2.0 * s, 97.2 + 1.4 * abs(math.sin(t)), 0.0)
     r["Hips"] = [2.5 * s, 5 * s, 0]
     return r, hips_pos
