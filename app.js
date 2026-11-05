@@ -78,11 +78,95 @@ async function loadBVHText(text, label) {
     if (entry.thumb && entry.middle) fingerOf[j.name] = entry;
   });
   buildSkeletonLines();
+  computeLegCorr();
   const seek = document.getElementById('seek');
   seek.max = bvh.frameCount - 1;
   seek.value = 0;
   playhead = 0;
   status(`BVH読み込み完了: ${label}（${bvh.joints.length}関節 / ${bvh.frameCount}フレーム @ ${(1 / bvh.frameTime).toFixed(0)}fps）`);
+}
+
+// Leg frame-convention correction (same fix as the BVH->VRMA converter
+// v4): geometric frames lose the legs' twist — SOMA BVH joint frames use
+// their own anatomical convention (bone direction = local +X, front = a
+// fixed other local axis, mirrored between left and right), so frames
+// built from joint positions roll the thigh/shin ~90 degrees (positions
+// stay right, the flesh faces sideways). For leg bones, take the world
+// orientation from the BVH's own quaternions, corrected by a constant
+// per-bone basis change. The front axis is identified from the data:
+// the BVH-local axis whose world image best tracks the knee-front /
+// foot-dorsum direction derived from joint positions.
+let legCorr = {}; // VRM bone name -> THREE.Quaternion
+const LEG_ROWS = [ // [srcName, boneName, childSrc, kind]
+  ['LeftLeg', 'leftUpperLeg', 'LeftShin', 'front'],
+  ['LeftShin', 'leftLowerLeg', 'LeftFoot', 'front'],
+  ['LeftFoot', 'leftFoot', 'LeftToeBase', 'up'],
+  ['RightLeg', 'rightUpperLeg', 'RightShin', 'front'],
+  ['RightShin', 'rightLowerLeg', 'RightFoot', 'front'],
+  ['RightFoot', 'rightFoot', 'RightToeBase', 'up'],
+];
+function computeLegCorr() {
+  legCorr = {};
+  try {
+    if (!bvhFirst['LeftLeg'] || !bvhFirst['RightLeg']) return;
+    const sideWorld = (w) => V3(w['LeftLeg'].pos).sub(V3(w['RightLeg'].pos)).normalize();
+    const canonC1 = (boneName) => boneName.includes('Foot')
+      ? new THREE.Vector3(0, -0.07, 0.12).normalize()
+      : new THREE.Vector3(0, -1, 0);
+    for (const [srcName, boneName, childSrc, kind] of LEG_ROWS) {
+      if (!bvhFirst[srcName] || !bvhFirst[childSrc]) continue;
+      const side = srcName.startsWith('Left') ? 'Left' : 'Right';
+      const toeName = `${side}ToeBase`, footName = `${side}Foot`;
+      const refSum = new THREE.Vector3();
+      const imgSum = { py: new THREE.Vector3(), ny: new THREE.Vector3(), pz: new THREE.Vector3(), nz: new THREE.Vector3() };
+      for (let f = 0; f < bvh.frameCount; f++) {
+        const w = sampleWorld(bvh, f);
+        const jp = V3(w[srcName].pos);
+        const boneDir = V3(w[childSrc].pos).sub(jp).normalize();
+        let ref;
+        if (kind === 'front') {
+          ref = new THREE.Vector3().crossVectors(boneDir, sideWorld(w)).normalize();
+        } else {
+          if (!w[toeName] || !w[footName]) continue;
+          const toeDir = V3(w[toeName].pos).sub(V3(w[footName].pos)).normalize();
+          ref = new THREE.Vector3().crossVectors(toeDir, sideWorld(w)).normalize();
+        }
+        refSum.add(ref);
+        const q = w[srcName].quat;
+        const tq = new THREE.Quaternion(q[0], q[1], q[2], q[3]);
+        imgSum.py.add(new THREE.Vector3(0, 1, 0).applyQuaternion(tq));
+        imgSum.ny.add(new THREE.Vector3(0, -1, 0).applyQuaternion(tq));
+        imgSum.pz.add(new THREE.Vector3(0, 0, 1).applyQuaternion(tq));
+        imgSum.nz.add(new THREE.Vector3(0, 0, -1).applyQuaternion(tq));
+      }
+      if (refSum.lengthSq() < 1e-6) continue;
+      refSum.normalize();
+      let best = null;
+      for (const [key, vec] of Object.entries(imgSum)) {
+        if (vec.lengthSq() < 1e-6) continue;
+        const d = vec.normalize().dot(refSum);
+        if (!best || d > best.d) best = { key, d };
+      }
+      if (!best || best.d < 0.5) continue;
+      const frontLocal = { py: new THREE.Vector3(0, 1, 0), ny: new THREE.Vector3(0, -1, 0),
+                           pz: new THREE.Vector3(0, 0, 1), nz: new THREE.Vector3(0, 0, -1) }[best.key];
+      const childJoint = bvh.joints.find((j) => j.name === childSrc);
+      const c1b = new THREE.Vector3(...childJoint.offset).normalize();
+      const c3b = new THREE.Vector3().crossVectors(c1b, frontLocal);
+      const qBvh = new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(c1b, frontLocal, c3b));
+      const c1v = canonC1(boneName);
+      let c2v;
+      if (kind === 'front') c2v = new THREE.Vector3(0, 0, 1);
+      else { const up = new THREE.Vector3(0, 1, 0); c2v = up.clone().addScaledVector(c1v, -up.dot(c1v)).normalize(); }
+      const c3v = new THREE.Vector3().crossVectors(c1v, c2v);
+      const qVrm = new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(c1v, c2v, c3v));
+      legCorr[boneName] = qBvh.multiply(qVrm.invert());
+    }
+    if (legCorr.leftFoot) legCorr.leftToes = legCorr.leftFoot;
+    if (legCorr.rightFoot) legCorr.rightToes = legCorr.rightFoot;
+  } catch (err) {
+    legCorr = {}; // never let the correction break BVH loading
+  }
 }
 
 function buildSkeletonLines() {
@@ -385,7 +469,11 @@ function applyPose(world) {
     let targetWorldQ;
     const parentTarget = r.followParent ? worldByBone.get(r.followParent) : null;
     const srcFing = fingerOf[r.srcName];
-    if (r.fingerFrame && srcFing && world[srcFing.thumb] && world[srcFing.middle]) {
+    if (legCorr[r.boneName] && world[r.srcName]) {
+      // legs: BVH's own world quaternion + basis correction (see computeLegCorr)
+      const q = world[r.srcName].quat;
+      targetWorldQ = new THREE.Quaternion(q[0], q[1], q[2], q[3]).multiply(legCorr[r.boneName]).multiply(r.restQ);
+    } else if (r.fingerFrame && srcFing && world[srcFing.thumb] && world[srcFing.middle]) {
       const jp0 = V3(world[r.srcName].pos);
       const aSrc = handFrameQuat(jp0, V3(world[srcFing.middle].pos), V3(world[srcFing.thumb].pos));
       targetWorldQ = aSrc.multiply(r.frameQ.clone().invert()).multiply(r.restQ);
@@ -500,6 +588,16 @@ addEventListener('drop', async (e) => {
     } catch (err) { status(`読み込み失敗 (${f.name}): ${err.message}`); }
   }
 });
+
+// hooks for headless verification
+window.__player = {
+  get vrm() { return vrm; },
+  get ready() { return !!vrm && rig.length > 0; },
+  get legCorrBones() { return Object.keys(legCorr); },
+  pause() { playing = false; },
+  async loadBVHUrl(url) { const t = await (await fetch(url)).text(); await loadBVHText(t, url); },
+  seekFrame(f) { playhead = f; applyPose(sampleWorld(bvh, f)); },
+};
 
 // ----------------------------------------------------------------------- boot
 (async () => {
