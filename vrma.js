@@ -195,7 +195,7 @@ window.__viewer = {
     if (!vrm) return null;
     const out = {};
     vrm.scene.updateMatrixWorld(true);
-    for (const b of ['hips','leftUpperArm','leftLowerArm','leftHand','rightUpperArm','rightLowerArm','rightHand']) {
+    for (const b of ['hips','leftUpperArm','leftLowerArm','leftHand','rightUpperArm','rightLowerArm','rightHand','leftUpperLeg','leftLowerLeg','leftFoot','leftToes','rightUpperLeg','rightLowerLeg','rightFoot','rightToes']) {
       const n = vrm.humanoid.getNormalizedBoneNode(b);
       if (!n) { out[b] = null; continue; }
       const p = n.getWorldPosition(new THREE.Vector3());
